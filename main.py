@@ -1,6 +1,5 @@
 """
-cron: 0 */6 * * *
-new Env("Linux.Do 签到")
+LinuxDo 每日签到
 """
 
 import os
@@ -52,10 +51,7 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "0",
     "off",
 ]
-if not USERNAME:
-    USERNAME = os.environ.get("USERNAME")
-if not PASSWORD:
-    PASSWORD = os.environ.get("PASSWORD")
+DISPLAY_NAME = USERNAME or "Cookie 用户"
 
 HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
@@ -119,6 +115,18 @@ class LinuxDoBrowser:
                 )
         return cookies
 
+    def _check_logged_in(self, retries=3, interval=2):
+        """通过 current-user 元素判断登录状态，异常不作为登录成功。"""
+        for attempt in range(retries):
+            try:
+                if self.page.ele("@id=current-user"):
+                    return True
+            except Exception as e:
+                logger.warning(f"登录状态检查异常: {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(interval)
+        return False
+
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
         logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
@@ -140,20 +148,11 @@ class LinuxDoBrowser:
         time.sleep(5)
 
         # 验证登录状态
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"Cookie 登录验证异常: {str(e)}")
-            return True
-        if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
-            return False
-        else:
+        if self._check_logged_in():
             logger.info("Cookie 登录验证成功")
             return True
+        logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+        return False
 
     def login(self):
         logger.info("开始账号密码登录")
@@ -166,12 +165,22 @@ class LinuxDoBrowser:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
-        if resp_csrf.status_code != 200:
-            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
-            return False        
-        csrf_data = resp_csrf.json()
+        try:
+            resp_csrf = self.session.get(
+                CSRF_URL, headers=headers, impersonate="firefox135", timeout=15
+            )
+            if resp_csrf.status_code != 200:
+                logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
+                return False
+            csrf_data = resp_csrf.json()
+        except Exception as e:
+            logger.error(f"获取 CSRF token 异常: {e}")
+            return False
+
         csrf_token = csrf_data.get("csrf")
+        if not csrf_token:
+            logger.error("获取 CSRF token 失败: 响应中缺少 csrf 字段")
+            return False
         logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
 
         # Step 2: Login
@@ -193,13 +202,28 @@ class LinuxDoBrowser:
 
         try:
             resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
+                SESSION_URL, data=data, impersonate="chrome136", headers=headers, timeout=15
             )
 
             if resp_login.status_code == 200:
                 response_json = resp_login.json()
-                if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
+                error = response_json.get("error")
+                if error:
+                    error_text = str(error).lower()
+                    if any(
+                        keyword in error_text
+                        for keyword in (
+                            "second factor",
+                            "two factor",
+                            "2fa",
+                            "第二因素",
+                            "两步",
+                            "验证码",
+                        )
+                    ):
+                        logger.error("登录失败: 账号启用了两步验证，当前不支持，请改用 Cookie 登录")
+                    else:
+                        logger.error(f"登录失败: {error}")
                     return False
                 logger.info("登录成功!")
             else:
@@ -232,29 +256,20 @@ class LinuxDoBrowser:
         self.page.get(HOME_URL)
 
         time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
-        else:
+        if self._check_logged_in():
             logger.info("登录验证成功")
             return True
+        logger.error("登录验证失败 (未找到 current-user)")
+        return False
 
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
         if not topic_list:
             logger.error("未找到主题帖")
             return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
+        sample_size = min(10, len(topic_list))
+        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择 {sample_size} 个")
+        for topic in random.sample(topic_list, sample_size):
             self.click_one_topic(topic.attr("href"))
         return True
 
@@ -307,22 +322,38 @@ class LinuxDoBrowser:
             # 优先使用手动 Cookie 登录，没有再使用账号密码
             if COOKIES:
                 login_res = self.login_with_cookies(COOKIES)
-                if not login_res:
+                if not login_res and USERNAME and PASSWORD:
                     logger.warning("Cookie 登录失败，尝试账号密码登录...")
                     login_res = self.login()
             else:
                 login_res = self.login()
             if not login_res:  # 登录
-                logger.warning("登录验证失败")
+                logger.error("登录验证失败，终止任务")
+                self.notifier.send_pushplus(
+                    "LINUX DO",
+                    f"❌每日登录失败: {DISPLAY_NAME}，请检查 Cookie 或账号密码",
+                )
+                return
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()  # 点击主题
                 if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
+                    logger.error("点击主题失败，发送通知并终止")
+                    self.notifier.send_pushplus(
+                        "LINUX DO",
+                        f"⚠️每日登录成功，但浏览任务失败: {DISPLAY_NAME}",
+                    )
                     return
                 logger.info("完成浏览任务")
             self.print_connect_info()  # 打印连接信息
             self.send_notifications(BROWSE_ENABLED)  # 发送通知
+        except Exception as e:
+            logger.exception(f"任务异常终止: {e}")
+            self.notifier.send_pushplus(
+                "LINUX DO",
+                f"❌任务异常终止: {DISPLAY_NAME}，请查看运行日志",
+            )
+            raise
         finally:
             try:
                 self.page.close()
@@ -352,37 +383,48 @@ class LinuxDoBrowser:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         }
-        resp = self.session.get(
-            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        info = []
+        try:
+            resp = self.session.get(
+                "https://connect.linux.do/",
+                headers=headers,
+                impersonate="chrome136",
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.error(f"获取 Connect Info 失败，状态码: {resp.status_code}")
+                return False
 
-        for row in rows:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                project = cells[0].text.strip()
-                current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                info.append([project, current, requirement])
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = soup.select("table tr")
+            info = []
+            for row in rows:
+                cells = row.select("td")
+                if len(cells) >= 3:
+                    project = cells[0].text.strip()
+                    current = cells[1].text.strip() if cells[1].text.strip() else "0"
+                    requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
+                    info.append([project, current, requirement])
+        except Exception as e:
+            logger.error(f"获取 Connect Info 异常: {e}")
+            return False
 
         logger.info("--------------Connect Info-----------------")
         logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        return True
 
     def send_notifications(self, browse_enabled):
         """发送签到通知"""
-        status_msg = f"✅每日登录成功: {USERNAME}"
+        status_msg = f"✅每日登录成功: {DISPLAY_NAME}"
         if browse_enabled:
             status_msg += " + 浏览任务完成"
         
-        # 使用通知管理器发送所有通知
-        self.notifier.send_all("LINUX DO", status_msg)
+        # 使用通知管理器发送通知
+        self.notifier.send_pushplus("LINUX DO", status_msg)
 
 
 if __name__ == "__main__":
     if not COOKIES and (not USERNAME or not PASSWORD):
-        print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
+        print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 LINUXDO_USERNAME 和 LINUXDO_PASSWORD（账号密码登录）")
         exit(1)
     browser = LinuxDoBrowser()
     browser.run()
